@@ -116,7 +116,7 @@ python merge_mp4_ffmpeg2.py mapbinlist.txt --push bilibili --title "生活向" -
 python merge_mp4_ffmpeg2.py mapbinlist.txt --push bilibili --push-login --title "标题"
 
 # 合并后通过 Playwright 浏览器上传 B 站（需在 playwright_push 中配置 Cookie）
-python merge_mp4_ffmpeg2.py mapbinlist.txt --push playwright_bilibili --title "我的视频"
+python3 merge_mp4_ffmpeg2.py mapbinlist.txt --push playwright_bilibili --title "我的视频"
 ```
 
 ### 3.2 B 站登录方式

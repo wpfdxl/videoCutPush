@@ -86,12 +86,12 @@ AUDIT_POLL_INTERVAL_SEC = 15
 AUDIT_POLL_MAX_MINUTES = 6
 
 # 视频上传与必填项就绪后再投稿（避免「未上传封面」等提示）
-# 等待「上传完成」的最长时间（秒），大文件可调大
-UPLOAD_COMPLETE_WAIT_SEC = 600
+# 动态监听「上传完成」的最长时间（秒），500M 等大文件可调大，建议 30 分钟以上
+UPLOAD_COMPLETE_WAIT_SEC = 1800
 # 轮询间隔（秒）
 UPLOAD_POLL_INTERVAL_SEC = 3
 # 上传完成后固定等待（秒），等 B 站用视频首帧生成封面、封面框里有值后再继续（建议 5–10 秒）
-WAIT_AFTER_UPLOAD_SEC = 10
+WAIT_AFTER_UPLOAD_SEC = 6
 # 封面就绪后、点投稿前再等几秒，确保「立即投稿」按钮出现（封面框有值后按钮才可用）
 WAIT_BEFORE_CLICK_SUBMIT_SEC = 2
 # 等待「立即投稿」按钮出现的最长时间（毫秒），封面慢时需更长
@@ -255,13 +255,28 @@ def _is_submit_ok(page):
 
 
 def _wait_upload_complete(page):
-    """等待页面出现「上传完成」或类似文案，表示视频已上传完。"""
-    deadline = time.time() + max(10, UPLOAD_COMPLETE_WAIT_SEC)
+    """
+    动态监听视频上传完成：只有页面出现「上传完成」或「上传成功」且不再显示「上传中」时才继续。
+    大文件（如 500M）会较久，轮询直到完成或超时。
+    """
+    deadline = time.time() + max(60, UPLOAD_COMPLETE_WAIT_SEC)
     interval = max(1, UPLOAD_POLL_INTERVAL_SEC)
+    last_log = 0
     while time.time() < deadline:
         try:
             text = page.inner_text("body")
-            if "上传完成" in text or "上传成功" in text or "100%" in text:
+            # 仍在「上传中」则继续等，不提前进入下一步
+            if "上传中" in text or "上传中..." in text:
+                if time.time() - last_log >= 10:
+                    print("  视频仍在上传中，继续等待...")
+                    last_log = time.time()
+                time.sleep(interval)
+                continue
+            # 明确出现「上传完成」或「上传成功」再继续
+            if "上传完成" in text or "上传成功" in text:
+                return True
+            # 可选：进度 100% 且无「上传中」也视为完成（部分页面文案）
+            if "100%" in text and "上传中" not in text:
                 return True
         except Exception:
             pass
@@ -416,10 +431,13 @@ def main(video_path_arg=None, title_arg=None):
                     # 3. 上传文件
                     file_input = page.locator('input[type="file"]').first
                     file_input.set_input_files(video_path)
-                    # 等视频上传完成再继续，避免点投稿时提示「未上传封面」
-                    print("等待视频上传完成...")
+                    # 动态监听视频上传完成后再进行下一步，大文件（如 500M）会等较久
+                    print("等待视频上传完成（动态监听，上传中会持续等待）...")
                     if not _wait_upload_complete(page):
-                        print("等待上传完成超时，继续尝试填表投稿。")
+                        print("等待上传完成超时，跳过本账号（未上传完不填表投稿）。")
+                        if context:
+                            context.close()
+                        continue
                     page.wait_for_timeout(2000)
                     # 上传完成后固定等 N 秒，让 B 站用视频首帧截图生成封面、封面框里有值
                     wait_sec = max(0, WAIT_AFTER_UPLOAD_SEC)

@@ -492,6 +492,10 @@ def main():
                 out, time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
             ))
 
+        # 合并完成后立即删除 _tmp 临时目录，释放空间（推送前就删）
+        if not args.keep_tmp:
+            _cleanup_temp_dir(temp_dir)
+
         # 可选：推送到 B 站等平台
         if args.push:
             if args.push == "playwright_bilibili":
