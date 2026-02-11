@@ -1,4 +1,4 @@
-# ffmpge_video_deal_test
+# videoCutPush
 
 MP4 小工具：**按列表文件合并**（ffmpeg 不重编码 / MoviePy 重编码压缩）、**推送到视频平台**（如 B 站，可选，形成闭环）。
 
