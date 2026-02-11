@@ -1,0 +1,12 @@
+tmp/*
+.idea
+.venv
+.mapbinlist.txt
+/mapbinlist_inte.txt
+# 推送临时文件（如扫码二维码图片）
+push/tmp/
+# 推送平台登录信息（勿提交）
+push/bilibili/cookie.json
+**/cookie.json
+__pycache__/
+push/bilibili/__pycache__/

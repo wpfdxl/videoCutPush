@@ -1,0 +1,8 @@
+# MoviePy 视频处理
+moviepy>=1.0.3
+# NumPy 2 与 opencv 4.6 不兼容会报 _ARRAY_API，先限制 numpy<2
+numpy<2
+# 从远程 OSS 下载 mp4
+requests>=2.28.0
+# 可选：若使用阿里云 OSS SDK 直读
+# oss2>=2.18.0
