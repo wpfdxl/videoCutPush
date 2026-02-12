@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-python2.7
+python3.7
 工程化流程：
 - 列表来源：mapbinlist 可为本地文件路径或公网 URL（自动拉取内容）。
 - 工作目录：每次运行在 tmp/ 下新建 merge_YYYYMMDD_HHMMSS/，内含下载分片、合并结果。

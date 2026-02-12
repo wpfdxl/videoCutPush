@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-B 站视频上传 - 通过 Python 调用 Playwright 实现（对应 MCP 文档中的流程）。
+B 站视频上传 - 通过 Python 调用 Playwright 实现。
 支持：视频路径、Cookie 变量/文件写死，手动抓 Cookie 后 set 上即可免登录。
 Python 3.7+，需安装 playwright 并执行 playwright install chromium。
 """

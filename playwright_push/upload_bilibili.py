@@ -107,20 +107,20 @@ HEADLESS = False
 
 # 上传完成后是否轮询审核结果（同步监听直到通过/不通过或超时）
 POLL_AUDIT = True
-# 轮询间隔（秒）
-AUDIT_POLL_INTERVAL_SEC = 15
+# 轮询间隔（秒），略短可更快出结果
+AUDIT_POLL_INTERVAL_SEC = 6
 # 轮询最长时长（分钟），超时后仍会关闭浏览器
-AUDIT_POLL_MAX_MINUTES = 6
+AUDIT_POLL_MAX_MINUTES = 10
 
 # 视频上传与必填项就绪后再投稿（避免「未上传封面」等提示）
 # 动态监听「上传完成」的最长时间（秒），500M 等大文件可调大，建议 30 分钟以上
 UPLOAD_COMPLETE_WAIT_SEC = 1800
-# 轮询间隔（秒）
-UPLOAD_POLL_INTERVAL_SEC = 3
-# 上传完成后固定等待（秒），等 B 站用视频首帧生成封面、封面框里有值后再继续（建议 5–10 秒）
-WAIT_AFTER_UPLOAD_SEC = 6
+# 轮询间隔（秒），略短可更快检测到上传完成/封面就绪
+UPLOAD_POLL_INTERVAL_SEC = 2
+# 上传完成后固定等待（秒），等 B 站用视频首帧生成封面、封面框里有值后再继续
+WAIT_AFTER_UPLOAD_SEC = 4
 # 封面就绪后、点投稿前再等几秒，确保「立即投稿」按钮出现（封面框有值后按钮才可用）
-WAIT_BEFORE_CLICK_SUBMIT_SEC = 2
+WAIT_BEFORE_CLICK_SUBMIT_SEC = 1
 # 等待「立即投稿」按钮出现的最长时间（毫秒），封面慢时需更长
 SUBMIT_BTN_VISIBLE_TIMEOUT_MS = 60000
 # 上传完成后，再等待封面/必填项就绪的最长时间（秒）
@@ -341,7 +341,7 @@ def _check_is_pubing_has_in_progress(context, timeout_sec=2):
         new_page = context.new_page()
         new_page.goto(IS_PUBING_URL, wait_until="domcontentloaded", timeout=15000)
         new_page.reload(wait_until="domcontentloaded", timeout=15000)  # 投稿完成后先刷新列表再检查
-        new_page.wait_for_timeout(500)  # 给列表渲染一点时间
+        new_page.wait_for_timeout(400)  # 给列表渲染一点时间
         deadline = time.time() + timeout_sec
         while time.time() < deadline:
             try:
@@ -350,7 +350,7 @@ def _check_is_pubing_has_in_progress(context, timeout_sec=2):
                     return True
             except Exception:
                 pass
-            new_page.wait_for_timeout(300)
+            new_page.wait_for_timeout(250)
         return False
     except Exception as e:
         _ulog("校验投稿中列表时出错: {}".format(e))
@@ -428,10 +428,65 @@ def _ensure_cover_from_first_frame(page):
                 except Exception:
                     btn.first.click(force=True, timeout=5000)
                 _ulog("已点击「{}」，等待封面生成...".format(label))
-                page.wait_for_timeout(3000)  # 等封面生成并填入封面框
+                page.wait_for_timeout(2000)  # 等封面生成并填入封面框
                 return True
     except Exception as e:
         _ulog("尝试使用首帧生成封面时出错: {}".format(e))
+    return False
+
+
+def _has_cover_image_in_dom(page):
+    """
+    检测页面上是否已有封面图（img 有 src 且已加载）。
+    B 站上传页封面通常在带 cover/poster 的容器内，或主区域内有尺寸合适的 img。
+    """
+    try:
+        return page.evaluate("""() => {
+            var imgs = document.querySelectorAll('img[src]');
+            for (var i = 0; i < imgs.length; i++) {
+                var img = imgs[i];
+                if (!img.src || img.src.length < 10) continue;
+                var w = img.naturalWidth || img.width || 0;
+                var h = img.naturalHeight || img.height || 0;
+                if (w >= 80 && h >= 60) return true;
+            }
+            var cover = document.querySelector('[class*="cover"] img[src], [class*="poster"] img[src]');
+            if (cover && cover.src && cover.src.length > 10) return true;
+            return false;
+        }""")
+    except Exception:
+        return False
+
+
+def _wait_cover_image_visible(page, timeout_sec=30):
+    """
+    上传完成后等待封面图真正出现：既无「封面图未上传」等提示，且 DOM 中有已加载的封面 img。
+    满足条件连续 2 次才返回 True，避免刚出现又消失。
+    """
+    _ulog("等待封面图出现在页面（无「封面图未上传」且封面区有图）...")
+    deadline = time.time() + timeout_sec
+    ok_count = 0
+    required_ok = 2
+    interval = max(1, UPLOAD_POLL_INTERVAL_SEC)
+    while time.time() < deadline:
+        try:
+            text = page.inner_text("body")
+            if _has_cover_not_ready_prompt(text):
+                ok_count = 0
+                time.sleep(interval)
+                continue
+            if not _has_cover_image_in_dom(page):
+                ok_count = 0
+                time.sleep(interval)
+                continue
+            ok_count += 1
+            if ok_count >= required_ok:
+                _ulog("封面图已出现，继续投稿。")
+                return True
+        except Exception:
+            ok_count = 0
+        time.sleep(interval)
+    _ulog("等待封面图出现超时（{} 秒），将尝试使用首帧并继续。".format(timeout_sec))
     return False
 
 
@@ -471,12 +526,12 @@ def _set_visibility_only_self(page):
         more_btn = page.get_by_text("更多设置", exact=False)
         if more_btn.count() > 0:
             more_btn.first.scroll_into_view_if_needed(timeout=5000)
-            page.wait_for_timeout(400)
+            page.wait_for_timeout(300)
             try:
                 more_btn.first.click(timeout=6000)
             except Exception:
                 more_btn.first.click(force=True, timeout=6000)
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(1000)
         js_ok = page.evaluate("""(targetLabel) => {
             const containers = document.querySelectorAll('.check-radio-v2-container');
             for (const c of containers) {
@@ -557,13 +612,13 @@ def wait_for_audit_result(page, title):
         try:
             # 已通过 tab：第一个作品标题是否为本视频
             page.goto(VIDEO_MANAGE_URL_PUBED, wait_until="domcontentloaded", timeout=20000)
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(1500)
             first_title_pubed = _get_first_article_title_on_manage_page(page)
             if first_title_pubed and first_title_pubed.strip() == title.strip():
                 return "passed"
             # 未通过 tab：第一个作品标题是否为本视频，且该条不是「审核中」
             page.goto(VIDEO_MANAGE_URL_NOT_PUBED, wait_until="domcontentloaded", timeout=20000)
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(1500)
             first_title_not_pubed = _get_first_article_title_on_manage_page(page)
             if first_title_not_pubed and first_title_not_pubed.strip() == title.strip():
                 row_text = _get_first_article_row_text(page)
@@ -575,7 +630,7 @@ def wait_for_audit_result(page, title):
             # 取不到第一个作品时回退
             if first_title_pubed is None:
                 page.goto(VIDEO_MANAGE_URL_PUBED, wait_until="domcontentloaded", timeout=20000)
-                page.wait_for_timeout(1000)
+                page.wait_for_timeout(800)
                 text_pubed = page.inner_text("body")
                 if title in text_pubed:
                     first_title_pubed = _get_first_article_title_on_manage_page(page)
@@ -583,7 +638,7 @@ def wait_for_audit_result(page, title):
                         return "passed"
             if first_title_not_pubed is None:
                 page.goto(VIDEO_MANAGE_URL_NOT_PUBED, wait_until="domcontentloaded", timeout=20000)
-                page.wait_for_timeout(1000)
+                page.wait_for_timeout(800)
                 text_not = page.inner_text("body")
                 if title in text_not:
                     first_title_not_pubed = _get_first_article_title_on_manage_page(page)
@@ -682,9 +737,13 @@ def main(video_path_arg=None, title_arg=None, gindex=None, guid=None, version=No
                     context.add_cookies(cookie_dict_to_playwright(cookies))
                     page = context.new_page()
 
-                    # 1. 打开上传页
+                    # 1. 打开上传页（等 dom 后短等，再等 file input 可见则尽早继续）
                     page.goto(UPLOAD_URL, wait_until="domcontentloaded", timeout=30000)
-                    page.wait_for_timeout(4000)
+                    try:
+                        page.locator('input[type="file"]').first.wait_for(state="attached", timeout=10000)
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(2000)
 
                     if _is_cookie_expired(page):
                         _ulog("[账号 {}] Cookie 已过期，换下一账号重试。".format(idx + 1))
@@ -714,7 +773,7 @@ def main(video_path_arg=None, title_arg=None, gindex=None, guid=None, version=No
                     file_input = page.locator('input[type="file"]').first
                     file_input.set_input_files(video_path)
                     # 上传视频过程中即可尝试勾选可见范围「仅自己可见」（页面出现更多设置后即可选）
-                    page.wait_for_timeout(6000)
+                    page.wait_for_timeout(4000)
                     _set_visibility_only_self(page)
                     # 动态监听视频上传完成后再进行下一步，大文件（如 500M）会等较久
                     _ulog("等待视频上传完成（动态监听，上传中会持续等待）...")
@@ -723,7 +782,7 @@ def main(video_path_arg=None, title_arg=None, gindex=None, guid=None, version=No
                         if context:
                             context.close()
                         continue
-                    page.wait_for_timeout(2000)
+                    page.wait_for_timeout(1000)
                     # 上传完成后固定等 N 秒，让 B 站用视频首帧截图生成封面、封面框里有值
                     wait_sec = max(0, WAIT_AFTER_UPLOAD_SEC)
                     if wait_sec > 0:
@@ -733,7 +792,10 @@ def main(video_path_arg=None, title_arg=None, gindex=None, guid=None, version=No
                     _ulog("等待封面与必填项就绪...")
                     if not _wait_cover_and_required_ready(page):
                         _ulog("等待封面就绪超时，继续尝试投稿。")
-                    page.wait_for_timeout(1500)
+                    page.wait_for_timeout(1000)
+                    # 先确认封面图真的出现在页面上，再填标题/投稿，避免点投稿时提示「封面图未上传」
+                    _wait_cover_image_visible(page, timeout_sec=30)
+                    page.wait_for_timeout(500)
 
                     # 4. 填标题
                     title_selector = 'input[placeholder*="标题"], .form-item input, textarea'
@@ -741,14 +803,14 @@ def main(video_path_arg=None, title_arg=None, gindex=None, guid=None, version=No
                         page.locator(title_selector).first.fill(title)
                     except Exception:
                         pass
-                    page.wait_for_timeout(1500)
+                    page.wait_for_timeout(800)
 
                     # 4.5 先点「保存」再投稿，确保视频信息提交保存
                     try:
                         save_btn = page.get_by_text("保存")
                         if save_btn.count() > 0:
                             save_btn.first.click(timeout=3000)
-                            page.wait_for_timeout(2000)
+                            page.wait_for_timeout(1500)
                     except Exception:
                         pass
 
@@ -771,7 +833,10 @@ def main(video_path_arg=None, title_arg=None, gindex=None, guid=None, version=No
                         except Exception:
                             ok_count = 0
                         page.wait_for_timeout(UPLOAD_POLL_INTERVAL_SEC * 1000)
-                    page.wait_for_timeout(2000)  # 封面就绪后再等 2 秒，确保封面框已填
+                    page.wait_for_timeout(1000)  # 封面就绪后再等 1 秒，确保封面框已填
+                    # 点投稿前再确认一次封面图已在 DOM 中（可能刚点了「使用首帧」）
+                    if not _has_cover_image_in_dom(page):
+                        _wait_cover_image_visible(page, timeout_sec=15)
                     # 封面就绪后再等几秒，让「立即投稿」按钮出现（先上传视频 → 等封面框有值 → 再触发投稿）
                     if WAIT_BEFORE_CLICK_SUBMIT_SEC > 0:
                         _ulog("封面就绪，等待 {} 秒后点击投稿...".format(WAIT_BEFORE_CLICK_SUBMIT_SEC))
@@ -794,7 +859,11 @@ def main(video_path_arg=None, title_arg=None, gindex=None, guid=None, version=No
                             submit_btn.click(timeout=10000)
                         except Exception:
                             submit_btn.click(force=True, timeout=10000)
-                        page.wait_for_timeout(5000)
+                        # 条件满足即继续：每 0.5s 检查是否已进入投稿结果页，最多等 6 秒
+                        for _ in range(12):
+                            page.wait_for_timeout(500)
+                            if _is_submit_ok(page):
+                                break
                         try:
                             text = page.inner_text("body")
                             if _has_cover_not_ready_prompt(text):
@@ -802,7 +871,7 @@ def main(video_path_arg=None, title_arg=None, gindex=None, guid=None, version=No
                                 page.keyboard.press("Escape")  # 关闭弹窗
                                 page.wait_for_timeout(500)
                                 _ensure_cover_from_first_frame(page)
-                                page.wait_for_timeout(2000)
+                                page.wait_for_timeout(1500)
                                 submit_btn = _get_submit_btn(page)
                                 if submit_btn:
                                     submit_btn.scroll_into_view_if_needed()
