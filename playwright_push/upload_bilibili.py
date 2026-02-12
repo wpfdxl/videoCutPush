@@ -91,13 +91,16 @@ UPLOAD_COMPLETE_WAIT_SEC = 1800
 # 轮询间隔（秒）
 UPLOAD_POLL_INTERVAL_SEC = 3
 # 上传完成后固定等待（秒），等 B 站用视频首帧生成封面、封面框里有值后再继续（建议 5–10 秒）
-WAIT_AFTER_UPLOAD_SEC = 6
+WAIT_AFTER_UPLOAD_SEC = 4
 # 封面就绪后、点投稿前再等几秒，确保「立即投稿」按钮出现（封面框有值后按钮才可用）
-WAIT_BEFORE_CLICK_SUBMIT_SEC = 2
+WAIT_BEFORE_CLICK_SUBMIT_SEC = 1
 # 等待「立即投稿」按钮出现的最长时间（毫秒），封面慢时需更长
 SUBMIT_BTN_VISIBLE_TIMEOUT_MS = 60000
 # 上传完成后，再等待封面/必填项就绪的最长时间（秒）
 COVER_READY_WAIT_SEC = 1
+
+# 可见范围（投稿前选择）：仅自己可见 / 公开 / 好友可见 等，与页面上选项文案一致，默认仅自己可见
+VISIBILITY = "仅自己可见"
 
 
 
@@ -322,30 +325,142 @@ def _wait_cover_and_required_ready(page):
     return False
 
 
+def _set_visibility_only_self(page):
+    """
+    在上传页设置可见范围为「仅自己可见」：展开更多设置 + JS 点击 .check-radio-v2-container。
+    可在上传视频过程中或上传完成后调用。
+    """
+    if not VISIBILITY:
+        return False
+    try:
+        page.keyboard.press("Escape")
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(500)
+        more_btn = page.get_by_text("更多设置", exact=False)
+        if more_btn.count() > 0:
+            more_btn.first.scroll_into_view_if_needed(timeout=5000)
+            page.wait_for_timeout(400)
+            try:
+                more_btn.first.click(timeout=6000)
+            except Exception:
+                more_btn.first.click(force=True, timeout=6000)
+            page.wait_for_timeout(1500)
+        js_ok = page.evaluate("""(targetLabel) => {
+            const containers = document.querySelectorAll('.check-radio-v2-container');
+            for (const c of containers) {
+                if (c.textContent && c.textContent.indexOf(targetLabel) >= 0) {
+                    c.click();
+                    return true;
+                }
+            }
+            return false;
+        }""", VISIBILITY)
+        if js_ok:
+            page.wait_for_timeout(500)
+            print("已设置可见范围: {}.".format(VISIBILITY))
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _get_first_article_title_on_manage_page(page):
+    """
+    稿件管理页（已通过/未通过）上取「第一个作品」的标题。
+    尝试常见列表结构，取不到则返回 None。
+    """
+    selectors = [
+        '[class*="list"] [class*="title"]',
+        '[class*="article"] [class*="title"]',
+        '[class*="item"] [class*="title"]',
+        '.upload-manager-list .title',
+        'a[href*="/video/"]',
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0:
+                t = loc.inner_text(timeout=2000).strip()
+                if t and len(t) < 500:
+                    return t
+        except Exception:
+            continue
+    return None
+
+
+def _get_first_article_row_text(page):
+    """
+    稿件管理页上取「第一个作品」整行或整块文案（含状态如「审核中」「未通过」等）。
+    用于区分审核中 vs 未通过。
+    """
+    selectors = [
+        '[class*="list"] [class*="item"]',
+        '[class*="article"] [class*="item"]',
+        '.upload-manager-list [class*="item"]',
+        'tr',
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0:
+                t = loc.inner_text(timeout=2000).strip()
+                if t and len(t) < 800:
+                    return t
+        except Exception:
+            continue
+    return None
+
+
 def wait_for_audit_result(page, title):
     """
-    上传成功后轮询：分别刷新「已通过」(group=pubed) 和「未通过」(group=not_pubed) 页，
-    看刚上传的视频标题出现在哪一页 → 在已通过即通过，在未通过即未通过。
+    上传成功后轮询：已通过 tab 第一个作品标题=本视频 → 通过；
+    未通过 tab 第一个作品标题=本视频 且 该条状态非「审核中」→ 未通过；审核中则继续等。
     返回 "passed" | "rejected" | "timeout"
     """
     max_seconds = max(1, AUDIT_POLL_MAX_MINUTES * 60)
     interval = max(1, AUDIT_POLL_INTERVAL_SEC)
     start = time.time()
-    print("正在监听审核结果（轮流刷新「已通过」与「未通过」页，看本视频标题在哪个列表，每 {} 秒，最长 {} 分钟）...".format(interval, AUDIT_POLL_MAX_MINUTES))
+    print("正在监听审核结果（已通过/未通过 tab，审核中不判为未通过，每 {} 秒，最长 {} 分钟）...".format(interval, AUDIT_POLL_MAX_MINUTES))
     while (time.time() - start) < max_seconds:
         try:
-            # 先看「已通过」列表里有没有本视频标题
+            # 已通过 tab：第一个作品标题是否为本视频
             page.goto(VIDEO_MANAGE_URL_PUBED, wait_until="domcontentloaded", timeout=20000)
             page.wait_for_timeout(2000)
-            text_pubed = page.inner_text("body")
-            if title in text_pubed:
+            first_title_pubed = _get_first_article_title_on_manage_page(page)
+            if first_title_pubed and first_title_pubed.strip() == title.strip():
                 return "passed"
-            # 再看「未通过」列表里有没有本视频标题
+            # 未通过 tab：第一个作品标题是否为本视频，且该条不是「审核中」
             page.goto(VIDEO_MANAGE_URL_NOT_PUBED, wait_until="domcontentloaded", timeout=20000)
             page.wait_for_timeout(2000)
-            text_not_pubed = page.inner_text("body")
-            if title in text_not_pubed:
-                return "rejected"
+            first_title_not_pubed = _get_first_article_title_on_manage_page(page)
+            if first_title_not_pubed and first_title_not_pubed.strip() == title.strip():
+                row_text = _get_first_article_row_text(page)
+                if row_text and "审核中" in row_text:
+                    # 仍在审核中，不判为未通过，继续轮询
+                    pass
+                else:
+                    return "rejected"
+            # 取不到第一个作品时回退
+            if first_title_pubed is None:
+                page.goto(VIDEO_MANAGE_URL_PUBED, wait_until="domcontentloaded", timeout=20000)
+                page.wait_for_timeout(1000)
+                text_pubed = page.inner_text("body")
+                if title in text_pubed:
+                    first_title_pubed = _get_first_article_title_on_manage_page(page)
+                    if first_title_pubed and first_title_pubed.strip() == title.strip():
+                        return "passed"
+            if first_title_not_pubed is None:
+                page.goto(VIDEO_MANAGE_URL_NOT_PUBED, wait_until="domcontentloaded", timeout=20000)
+                page.wait_for_timeout(1000)
+                text_not = page.inner_text("body")
+                if title in text_not:
+                    first_title_not_pubed = _get_first_article_title_on_manage_page(page)
+                    if first_title_not_pubed and first_title_not_pubed.strip() == title.strip():
+                        row_text = _get_first_article_row_text(page)
+                        if row_text and "审核中" in row_text:
+                            pass
+                        else:
+                            return "rejected"
         except Exception as e:
             print("轮询审核状态时出错: {}".format(e))
         time.sleep(interval)
@@ -431,6 +546,9 @@ def main(video_path_arg=None, title_arg=None):
                     # 3. 上传文件
                     file_input = page.locator('input[type="file"]').first
                     file_input.set_input_files(video_path)
+                    # 上传视频过程中即可尝试勾选可见范围「仅自己可见」（页面出现更多设置后即可选）
+                    page.wait_for_timeout(6000)
+                    _set_visibility_only_self(page)
                     # 动态监听视频上传完成后再进行下一步，大文件（如 500M）会等较久
                     print("等待视频上传完成（动态监听，上传中会持续等待）...")
                     if not _wait_upload_complete(page):
@@ -483,6 +601,9 @@ def main(video_path_arg=None, title_arg=None):
                     if WAIT_BEFORE_CLICK_SUBMIT_SEC > 0:
                         print("封面就绪，等待 {} 秒后点击投稿...".format(WAIT_BEFORE_CLICK_SUBMIT_SEC))
                         page.wait_for_timeout(WAIT_BEFORE_CLICK_SUBMIT_SEC * 1000)
+
+                    # 4.7 投稿前再设一次可见范围（若上传过程中未勾选成功）
+                    _set_visibility_only_self(page)
 
                     # 5. 点击立即投稿（若有封面上传提示则等 2 秒再点一次）
                     submit_btn = page.get_by_text("立即投稿")
