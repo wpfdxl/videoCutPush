@@ -666,7 +666,7 @@ def main(video_path_arg=None, title_arg=None, gindex=None, guid=None, version=No
             if not os.path.isfile(cookie_path):
                 _ulog("Cookie 文件不存在: {}".format(cookie_path))
                 continue
-            _ulog("正在从 Cookie 文件加载: {}".format(cookie_path))
+            #_ulog("正在从 Cookie 文件加载: {}".format(cookie_path))
             cookies_list = load_cookies_from_file(cookie_path)
             if cookies_list:
                 break
