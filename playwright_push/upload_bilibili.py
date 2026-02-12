@@ -551,103 +551,72 @@ def _set_visibility_only_self(page):
     return False
 
 
-def _get_first_article_title_on_manage_page(page):
+def _page_has_article_with_title(page, title):
     """
-    稿件管理页（已通过/未通过）上取「第一个作品」的标题。
-    尝试常见列表结构，取不到则返回 None。
+    稿件管理页整页按标题匹配：是否有一条稿件的标题等于给定 title（不限于第一条）。
     """
-    selectors = [
-        '[class*="list"] [class*="title"]',
-        '[class*="article"] [class*="title"]',
-        '[class*="item"] [class*="title"]',
-        '.upload-manager-list .title',
-        'a[href*="/video/"]',
-    ]
-    for sel in selectors:
-        try:
-            loc = page.locator(sel).first
-            if loc.count() > 0:
-                t = loc.inner_text(timeout=2000).strip()
-                if t and len(t) < 500:
-                    return t
-        except Exception:
-            continue
-    return None
+    try:
+        t = (title or "").strip()
+        if not t:
+            return False
+        return page.evaluate("""(target) => {
+            var els = document.querySelectorAll('[class*="title"], a[href*="/video/"]');
+            for (var i = 0; i < els.length; i++) {
+                var text = (els[i].innerText || els[i].textContent || '').trim();
+                if (text === target) return true;
+            }
+            return false;
+        }""", t)
+    except Exception:
+        return False
 
 
-def _get_first_article_row_text(page):
+def _get_article_row_text_by_title(page, title):
     """
-    稿件管理页上取「第一个作品」整行或整块文案（含状态如「审核中」「未通过」等）。
-    用于区分审核中 vs 未通过。
+    稿件管理页整页按标题匹配：找到标题为 title 的那一条所在行的整行文案（含「审核中」等状态）。
     """
-    selectors = [
-        '[class*="list"] [class*="item"]',
-        '[class*="article"] [class*="item"]',
-        '.upload-manager-list [class*="item"]',
-        'tr',
-    ]
-    for sel in selectors:
-        try:
-            loc = page.locator(sel).first
-            if loc.count() > 0:
-                t = loc.inner_text(timeout=2000).strip()
-                if t and len(t) < 800:
-                    return t
-        except Exception:
-            continue
-    return None
+    try:
+        t = (title or "").strip()
+        if not t:
+            return None
+        return page.evaluate("""(target) => {
+            var items = document.querySelectorAll('[class*="item"], [class*="article"], [class*="list"] > div, tr');
+            for (var i = 0; i < items.length; i++) {
+                var text = (items[i].innerText || items[i].textContent || '');
+                if (text.indexOf(target) >= 0) return text.substring(0, 1000);
+            }
+            return null;
+        }""", t)
+    except Exception:
+        return None
 
 
 def wait_for_audit_result(page, title):
     """
-    上传成功后轮询：已通过 tab 第一个作品标题=本视频 → 通过；
-    未通过 tab 第一个作品标题=本视频 且 该条状态非「审核中」→ 未通过；审核中则继续等。
+    上传成功后轮询：已通过 tab 整页按标题匹配到本视频 → 通过；
+    未通过 tab 整页按标题匹配到本视频且该条状态非「审核中」→ 未通过；审核中则继续等。
     返回 "passed" | "rejected" | "timeout"
     """
     max_seconds = max(1, AUDIT_POLL_MAX_MINUTES * 60)
     interval = max(1, AUDIT_POLL_INTERVAL_SEC)
     start = time.time()
-    _ulog("正在监听审核结果（已通过/未通过 tab，审核中不判为未通过，每 {} 秒，最长 {} 分钟）...".format(interval, AUDIT_POLL_MAX_MINUTES))
+    _ulog("正在监听审核结果（已通过/未通过 tab 整页按标题匹配，审核中不判为未通过，每 {} 秒，最长 {} 分钟）...".format(interval, AUDIT_POLL_MAX_MINUTES))
     while (time.time() - start) < max_seconds:
         try:
-            # 已通过 tab：第一个作品标题是否为本视频
+            # 已通过 tab：整页是否有标题=本视频
             page.goto(VIDEO_MANAGE_URL_PUBED, wait_until="domcontentloaded", timeout=20000)
             page.wait_for_timeout(1500)
-            first_title_pubed = _get_first_article_title_on_manage_page(page)
-            if first_title_pubed and first_title_pubed.strip() == title.strip():
+            if _page_has_article_with_title(page, title):
                 return "passed"
-            # 未通过 tab：第一个作品标题是否为本视频，且该条不是「审核中」
+            # 未通过 tab：整页是否有标题=本视频，且该条不是「审核中」
             page.goto(VIDEO_MANAGE_URL_NOT_PUBED, wait_until="domcontentloaded", timeout=20000)
             page.wait_for_timeout(1500)
-            first_title_not_pubed = _get_first_article_title_on_manage_page(page)
-            if first_title_not_pubed and first_title_not_pubed.strip() == title.strip():
-                row_text = _get_first_article_row_text(page)
+            if _page_has_article_with_title(page, title):
+                row_text = _get_article_row_text_by_title(page, title)
                 if row_text and "审核中" in row_text:
-                    # 仍在审核中，不判为未通过，继续轮询
                     pass
                 else:
                     return "rejected"
-            # 取不到第一个作品时回退
-            if first_title_pubed is None:
-                page.goto(VIDEO_MANAGE_URL_PUBED, wait_until="domcontentloaded", timeout=20000)
-                page.wait_for_timeout(800)
-                text_pubed = page.inner_text("body")
-                if title in text_pubed:
-                    first_title_pubed = _get_first_article_title_on_manage_page(page)
-                    if first_title_pubed and first_title_pubed.strip() == title.strip():
-                        return "passed"
-            if first_title_not_pubed is None:
-                page.goto(VIDEO_MANAGE_URL_NOT_PUBED, wait_until="domcontentloaded", timeout=20000)
-                page.wait_for_timeout(800)
-                text_not = page.inner_text("body")
-                if title in text_not:
-                    first_title_not_pubed = _get_first_article_title_on_manage_page(page)
-                    if first_title_not_pubed and first_title_not_pubed.strip() == title.strip():
-                        row_text = _get_first_article_row_text(page)
-                        if row_text and "审核中" in row_text:
-                            pass
-                        else:
-                            return "rejected"
         except Exception as e:
             _ulog("轮询审核状态时出错: {}".format(e))
         time.sleep(interval)

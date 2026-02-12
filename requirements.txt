@@ -1,13 +1,7 @@
-# MoviePy 视频处理
-moviepy>=1.0.3
-# NumPy 2 与 opencv 4.6 不兼容会报 _ARRAY_API，先限制 numpy<2
-numpy<2
-# cv
-opencv-python<=4.6.0.66
-opencv-contrib-python<=4.6.0.66
-# 从远程 OSS 下载 mp4
-requests>=2.28.0
-# 可选：若使用阿里云 OSS SDK 直读
-# oss2>=2.18.0
+# B 站 Playwright 上传脚本依赖
+# Python 3.7+
+playwright>=1.40.0
+# POST 接口 api_push.py 需要
+flask>=2.0.0
 
-qrcode>=7.3.1
+requests

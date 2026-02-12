@@ -89,10 +89,10 @@ def _parse_concat_list(list_path):
 
 def _default_output_basename(paths):
     """
-    根据列表中的路径/URL 顺序生成唯一 MD5，用作默认输出文件名（不含扩展名）。
-    同一列表多次运行得到相同文件名，不同列表得到不同文件名。
+    按参数 videos（路径/URL 列表）生成 MD5 作为输出文件名，不按单一路径命名。
+    同一 videos 列表多次运行得到相同文件名，不同列表得到不同文件名。
     """
-    raw = "\n".join(paths)
+    raw = "\n".join(p if isinstance(p, str) else str(p) for p in paths)
     if not isinstance(raw, type(b"")):
         raw = raw.encode("utf-8")
     return hashlib.md5(raw).hexdigest()

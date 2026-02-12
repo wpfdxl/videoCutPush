@@ -7,6 +7,7 @@ Playwright B 站投稿 POST 接口：接收 mp4 地址数组，先按 merge_mp4_
 from __future__ import print_function
 
 import os
+import shutil
 import sys
 import time
 
@@ -152,12 +153,27 @@ def push_playwright_bilibili():
             "version": version or "",
         }
 
+    def _remove_merged_file():
+        if not merged_path:
+            return
+        try:
+            if os.path.isfile(merged_path):
+                os.remove(merged_path)
+                _api_log("已删除合成临时文件: {}".format(merged_path))
+            merge_dir = os.path.dirname(merged_path)
+            if merge_dir and os.path.isdir(merge_dir) and "merge_api_" in os.path.basename(merge_dir):
+                shutil.rmtree(merge_dir, ignore_errors=True)
+                _api_log("已删除合成临时目录: {}".format(merge_dir))
+        except Exception as e:
+            _api_log("删除合成文件或目录失败: {}".format(e))
+
     total_elapsed = round(time.time() - request_start, 2)
     if last_result is not None and last_result.audit_status in ("passed", "rejected"):
         # 审核已通过 或 未通过：code=0，由调用方根据 audit_status 判断
         data_item = _make_data_item(last_result)
         data_item["error_reason"] = "" if last_result.audit_status == "passed" else (last_result.reason or "")
         _api_log("接口请求完成 code=0，审核状态={}，总耗时 {} 秒".format(last_result.audit_status, total_elapsed))
+        _remove_merged_file()
         return jsonify({"code": 0, "data": [data_item]})
 
     # 其余均为 code=-200：Cookie 错误、push 失败、超时、未提交成功等
@@ -165,6 +181,7 @@ def push_playwright_bilibili():
     _api_log("接口请求完成 code=-200，原因: {}，总耗时 {} 秒".format(
         (last_result.reason if last_result else (str(last_error) if last_error else "")) or "失败", total_elapsed
     ))
+    _remove_merged_file()
     return jsonify({"code": -200, "data": [data_item]}), 200
 
 
