@@ -370,6 +370,60 @@ def _cleanup_temp_dir(temp_dir):
             pass
 
 
+def merge_paths_to_one(
+    paths,
+    output_path=None,
+    base_dir=None,
+    reencode=False,
+    ffmpeg_bin="ffmpeg",
+    keep_tmp=False,
+):
+    """
+    将 paths（本地路径或 URL 列表）按 merge_mp4_ffmpeg2 逻辑合并为一个 mp4。
+    供 API 或其它脚本调用，与命令行流程一致：下载/复制 -> concat -> remux 或 reencode。
+    :param paths: 列表，每项为本地路径或 http(s) URL
+    :param output_path: 最终输出 mp4 路径，不传则生成到 tmp/merge_api_xxx/<md5>.mp4
+    :param base_dir: 工作目录根，不传用 BASE_DIR
+    :param reencode: 是否重编码（B 站时间戳严格时可传 True）
+    :param ffmpeg_bin: ffmpeg 命令
+    :param keep_tmp: 是否保留临时目录
+    :return: 合并后的视频绝对路径
+    """
+    if not paths:
+        raise ValueError("paths 不能为空")
+    base_dir = base_dir or BASE_DIR
+    tmp_dir = os.path.join(base_dir, "tmp")
+    if not os.path.exists(tmp_dir):
+        os.makedirs(tmp_dir)
+    run_id = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    work_dir = os.path.join(tmp_dir, "merge_api_{}".format(run_id))
+    temp_dir = os.path.join(work_dir, TMP_SUBDIR_NAME)
+    os.makedirs(work_dir)
+    os.makedirs(temp_dir)
+
+    if output_path is None:
+        output_path = os.path.join(work_dir, _default_output_basename(paths) + ".mp4")
+    else:
+        output_path = os.path.abspath(output_path)
+
+    try:
+        local_names = _prepare_videos_to_dir(paths, temp_dir)
+        list_path = _write_local_concat_list(temp_dir, local_names)
+        merged_raw = os.path.join(temp_dir, "merged_raw.mp4")
+        merge_by_concat_list(list_path, merged_raw, ffmpeg_bin)
+        if reencode:
+            fix_timestamps_reencode(merged_raw, output_path, ffmpeg_bin)
+        else:
+            fix_timestamps_remux(merged_raw, output_path, ffmpeg_bin)
+        if not keep_tmp:
+            _cleanup_temp_dir(temp_dir)
+        return os.path.abspath(output_path)
+    except Exception:
+        if not keep_tmp:
+            _cleanup_temp_dir(temp_dir)
+        raise
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="按 mapbinlist 下载/复制视频到临时目录，合并为单个 mp4，并修复时间戳以兼容三方平台"

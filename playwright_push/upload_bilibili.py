@@ -9,8 +9,16 @@ from __future__ import print_function
 import atexit
 import json
 import os
+import random
 import sys
 import time
+
+try:
+    from urllib.request import Request, urlopen
+    from urllib.error import URLError, HTTPError
+except ImportError:
+    Request = urlopen = None
+    URLError = HTTPError = Exception
 
 _browser_to_close = None
 
@@ -31,18 +39,43 @@ atexit.register(_ensure_browser_closed)
 
 class UploadResult(object):
     """上传/投稿结果对象，供调用方使用。"""
-    __slots__ = ("filename", "audit_status", "reason", "success")
+    __slots__ = ("filename", "audit_status", "reason", "success", "dede_user_id", "duration_sec")
 
-    def __init__(self, filename, audit_status, reason, success=False):
-        self.filename = filename       # 文件名（视频 basename）
+    def __init__(self, filename, audit_status, reason, success=False, dede_user_id=None, duration_sec=None):
+        self.filename = filename
         self.audit_status = audit_status  # 审核状态：passed / rejected / timeout / submitted / error
-        self.reason = reason           # 成功或失败原因描述
-        self.success = success         # 是否成功（提交且审核通过为 True）
+        self.reason = reason              # 成功或失败原因描述（失败时为错误原因）
+        self.success = success
+        self.dede_user_id = dede_user_id or ""   # 使用的 cookie 的 DedeUserID
+        self.duration_sec = duration_sec        # 耗时（秒）
 
     def __repr__(self):
-        return "UploadResult(filename={!r}, audit_status={!r}, reason={!r}, success={})".format(
-            self.filename, self.audit_status, self.reason, self.success
+        return "UploadResult(filename={!r}, audit_status={!r}, reason={!r}, success={}, dede_user_id={!r}, duration_sec={})".format(
+            self.filename, self.audit_status, self.reason, self.success, self.dede_user_id, self.duration_sec
         )
+
+
+# 日志上下文（API 调用时传入 gindex/guid/version，日志会带 DedeUserID、视频名、gindex、guid、version）
+_upload_log_ctx = {}
+
+
+def _ulog(msg):
+    """带时间戳和上下文的日志：先打时间，再打 DedeUserID/video_name/gindex/guid/version 前缀。"""
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    ctx = _upload_log_ctx
+    parts = []
+    if ctx.get("DedeUserID") is not None and ctx.get("DedeUserID") != "":
+        parts.append("DedeUserID={}".format(ctx["DedeUserID"]))
+    if ctx.get("video_name"):
+        parts.append("video={}".format(ctx["video_name"]))
+    if ctx.get("gindex") is not None:
+        parts.append("gindex={}".format(ctx["gindex"]))
+    if ctx.get("guid"):
+        parts.append("guid={}".format(ctx["guid"]))
+    if ctx.get("version") is not None and ctx.get("version") != "":
+        parts.append("version={}".format(ctx["version"]))
+    prefix = "[{}] ".format(" ".join(parts)) if parts else ""
+    print("{} {}{}".format(ts, prefix, msg))
 
 
 # ========== 可写死的变量 ==========
@@ -54,26 +87,20 @@ VIDEO_TITLE = ""
 
 # Cookie：支持数组，多账号时按顺序重试（过期或账号限制则换下一个）
 # 方式1：COOKIES_LIST 为数组，每项为一个账号的 cookie 对象（dict 或含 cookie_info 的对象）
-COOKIES_LIST = [
-    # 账号1
-    {
-        "SESSDATA": "33f02fef%2C1786325952%2C7a906%2A21CjDGi5LVu1p786bFV2GhLP5vGzaPcl-UyFOyr4VEA8wfQxOJrXGcdMRJq04qriIL-y0SVjNRRVByMENWbE1MU0t6Z2pQcGVVeHRxR2xoN2RnVDVwNGNBdTBvcmVmX2RRNjlXVXNBajhnTEZZM1BocWtRYWpFY2VzZmZhOVAxX0xRdDNZTklDOVl3IIEC",
-        "bili_jct": "85dfc90d754e01b1152b638387cdbe32",
-        "DedeUserID": "412653959",
-    },
-    # 账号2（可选，cookie 过期或上传限制时自动换此账号重试）
-    # {"SESSDATA": "...", "bili_jct": "...", "DedeUserID": "..."},
-]
+COOKIES_LIST = []  # 留空则使用 COOKIE_FILE
 
 # 方式2：单账号时可沿用 COOKIES_DICT / COOKIE_FILE（会转成单元素列表）
 COOKIES_DICT = None
-COOKIE_FILE = None  # 例如 "push/bilibili/cookie.json"
+# 使用 playwright_push/cookie.json（与当前脚本同目录）
+COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookie.json")
 
 # 上传页地址
 UPLOAD_URL = "https://member.bilibili.com/platform/upload/video/frame"
 # 稿件管理页：已通过（pubed）、未通过（not_pubed），轮询时来回刷新这两页看标题在哪个列表
 VIDEO_MANAGE_URL_PUBED = "https://member.bilibili.com/platform/upload-manager/article?group=pubed&page=1"
 VIDEO_MANAGE_URL_NOT_PUBED = "https://member.bilibili.com/platform/upload-manager/article?group=not_pubed&page=1"
+# 投稿中列表，用于投稿完成后校验是否出现「进行中」（未出现则重试投稿）
+IS_PUBING_URL = "https://member.bilibili.com/platform/upload-manager/article?group=is_pubing&page=1"
 
 # 是否无头模式（False 可看到浏览器操作）
 HEADLESS = False
@@ -91,9 +118,9 @@ UPLOAD_COMPLETE_WAIT_SEC = 1800
 # 轮询间隔（秒）
 UPLOAD_POLL_INTERVAL_SEC = 3
 # 上传完成后固定等待（秒），等 B 站用视频首帧生成封面、封面框里有值后再继续（建议 5–10 秒）
-WAIT_AFTER_UPLOAD_SEC = 4
+WAIT_AFTER_UPLOAD_SEC = 6
 # 封面就绪后、点投稿前再等几秒，确保「立即投稿」按钮出现（封面框有值后按钮才可用）
-WAIT_BEFORE_CLICK_SUBMIT_SEC = 1
+WAIT_BEFORE_CLICK_SUBMIT_SEC = 2
 # 等待「立即投稿」按钮出现的最长时间（毫秒），封面慢时需更长
 SUBMIT_BTN_VISIBLE_TIMEOUT_MS = 60000
 # 上传完成后，再等待封面/必填项就绪的最长时间（秒）
@@ -101,6 +128,9 @@ COVER_READY_WAIT_SEC = 1
 
 # 可见范围（投稿前选择）：仅自己可见 / 公开 / 好友可见 等，与页面上选项文案一致，默认仅自己可见
 VISIBILITY = "仅自己可见"
+
+# 飞书机器人 webhook：Cookie 不可用时发送通知。不配置则不通知。可从环境变量 FEISHU_WEBHOOK_URL 读取
+FEISHU_WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK_URL", "")
 
 
 
@@ -140,7 +170,13 @@ def load_cookies_from_file(path):
     try:
         data = json.loads(raw)
     except Exception:
-        return None
+        # 兼容尾部逗号等不标准 JSON（如 "DedeUserID": "xxx", }）
+        import re
+        raw = re.sub(r",\s*([}\]])", r"\1", raw)
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return None
     # 文件是数组：[{...}, {...}]
     if isinstance(data, list):
         result = []
@@ -219,6 +255,29 @@ def get_cookies_list():
     return None
 
 
+def _notify_feishu_cookie_invalid(reason, dede_user_id=None):
+    """Cookie 不可用时发送飞书机器人通知（需配置 FEISHU_WEBHOOK_URL）。"""
+    url = (FEISHU_WEBHOOK_URL or "").strip()
+    if not url or not url.startswith("http"):
+        return
+    if not Request or not urlopen:
+        return
+    try:
+        text = "【B 站投稿】Cookie 不可用\n原因: {}".format(reason)
+        if dede_user_id:
+            text += "\nDedeUserID: {}".format(dede_user_id)
+        body = json.dumps({"msg_type": "text", "content": {"text": text}}, ensure_ascii=False)
+        req = Request(
+            url,
+            data=body.encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+        urlopen(req, timeout=10)
+    except Exception as e:
+        _ulog("飞书通知发送失败: {}".format(e))
+
+
 def _is_cookie_expired(page):
     """根据当前页 URL 或文案判断是否未登录（Cookie 过期）。"""
     try:
@@ -257,6 +316,53 @@ def _is_submit_ok(page):
         return False
 
 
+def _get_submit_btn(page):
+    """
+    获取投稿按钮：先等「立即投稿」，超时则试「投稿」（B 站有时只显示投稿）。
+    返回可点击的 locator 或 None。
+    """
+    for label, timeout_ms in [("立即投稿", min(25000, SUBMIT_BTN_VISIBLE_TIMEOUT_MS)), ("投稿", 10000)]:
+        try:
+            btn = page.get_by_text(label)
+            btn.wait_for(state="visible", timeout=timeout_ms)
+            return btn.first
+        except Exception:
+            continue
+    return None
+
+
+def _check_is_pubing_has_in_progress(context, timeout_sec=2):
+    """
+    新开 tab 打开「投稿中」列表页，先刷新该页再在 timeout_sec 内检查是否出现「进行中」。
+    用于投稿完成后校验是否真的进入投稿中列表；未出现则说明可能没提交保存成功。
+    """
+    new_page = None
+    try:
+        new_page = context.new_page()
+        new_page.goto(IS_PUBING_URL, wait_until="domcontentloaded", timeout=15000)
+        new_page.reload(wait_until="domcontentloaded", timeout=15000)  # 投稿完成后先刷新列表再检查
+        new_page.wait_for_timeout(500)  # 给列表渲染一点时间
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            try:
+                text = new_page.inner_text("body")
+                if "进行中" in text:
+                    return True
+            except Exception:
+                pass
+            new_page.wait_for_timeout(300)
+        return False
+    except Exception as e:
+        _ulog("校验投稿中列表时出错: {}".format(e))
+        return False
+    finally:
+        if new_page:
+            try:
+                new_page.close()
+            except Exception:
+                pass
+
+
 def _wait_upload_complete(page):
     """
     动态监听视频上传完成：只有页面出现「上传完成」或「上传成功」且不再显示「上传中」时才继续。
@@ -271,7 +377,7 @@ def _wait_upload_complete(page):
             # 仍在「上传中」则继续等，不提前进入下一步
             if "上传中" in text or "上传中..." in text:
                 if time.time() - last_log >= 10:
-                    print("  视频仍在上传中，继续等待...")
+                    _ulog("  视频仍在上传中，继续等待...")
                     last_log = time.time()
                 time.sleep(interval)
                 continue
@@ -288,11 +394,14 @@ def _wait_upload_complete(page):
 
 
 def _has_cover_not_ready_prompt(text):
-    """页面是否仍有「封面未就绪」类提示（封面图未上传、未上传封面等）。"""
+    """页面是否仍有「封面未就绪」类提示（请先上传封面、封面图未上传等）。"""
     if not text:
         return False
     prompts = (
+        "请先上传封面",
         "封面图未上传",
+        "封面图没识别出来",
+        "封面没识别出来",
         "未上传封面",
         "请上传封面",
         "请选择封面",
@@ -300,6 +409,29 @@ def _has_cover_not_ready_prompt(text):
     for p in prompts:
         if p in text:
             return True
+    return False
+
+
+def _ensure_cover_from_first_frame(page):
+    """
+    若封面框还没图，尝试点击「使用首帧」/「截取首帧」等按钮，让 B 站用视频首帧生成封面。
+    投稿前调用，避免点投稿时弹出「请先上传封面」。
+    """
+    try:
+        for label in ("使用首帧", "截取首帧", "从视频截取", "首帧", "截取封面"):
+            btn = page.get_by_text(label, exact=False)
+            if btn.count() > 0:
+                btn.first.scroll_into_view_if_needed(timeout=3000)
+                page.wait_for_timeout(300)
+                try:
+                    btn.first.click(timeout=5000)
+                except Exception:
+                    btn.first.click(force=True, timeout=5000)
+                _ulog("已点击「{}」，等待封面生成...".format(label))
+                page.wait_for_timeout(3000)  # 等封面生成并填入封面框
+                return True
+    except Exception as e:
+        _ulog("尝试使用首帧生成封面时出错: {}".format(e))
     return False
 
 
@@ -357,7 +489,7 @@ def _set_visibility_only_self(page):
         }""", VISIBILITY)
         if js_ok:
             page.wait_for_timeout(500)
-            print("已设置可见范围: {}.".format(VISIBILITY))
+            _ulog("已设置可见范围: {}.".format(VISIBILITY))
             return True
     except Exception:
         pass
@@ -420,7 +552,7 @@ def wait_for_audit_result(page, title):
     max_seconds = max(1, AUDIT_POLL_MAX_MINUTES * 60)
     interval = max(1, AUDIT_POLL_INTERVAL_SEC)
     start = time.time()
-    print("正在监听审核结果（已通过/未通过 tab，审核中不判为未通过，每 {} 秒，最长 {} 分钟）...".format(interval, AUDIT_POLL_MAX_MINUTES))
+    _ulog("正在监听审核结果（已通过/未通过 tab，审核中不判为未通过，每 {} 秒，最长 {} 分钟）...".format(interval, AUDIT_POLL_MAX_MINUTES))
     while (time.time() - start) < max_seconds:
         try:
             # 已通过 tab：第一个作品标题是否为本视频
@@ -462,44 +594,76 @@ def wait_for_audit_result(page, title):
                         else:
                             return "rejected"
         except Exception as e:
-            print("轮询审核状态时出错: {}".format(e))
+            _ulog("轮询审核状态时出错: {}".format(e))
         time.sleep(interval)
     return "timeout"
 
 
-def main(video_path_arg=None, title_arg=None):
+def main(video_path_arg=None, title_arg=None, gindex=None, guid=None, version=None, cookie_file=None):
     """
-    入口。可由命令行或 merge_mp4_ffmpeg2 调用。
+    入口。可由命令行、merge_mp4_ffmpeg2 或 POST 接口调用。
     :param video_path_arg: 要上传的视频路径（不传则用脚本内 VIDEO_PATH）
     :param title_arg: 投稿标题（不传则用脚本内 VIDEO_TITLE 或文件名）
-    :return: UploadResult(filename, audit_status, reason, success)
+    :param gindex: 可选，接口传入的 gindex，日志会带上
+    :param guid: 可选，接口传入的 guid，日志会带上
+    :param version: 可选，接口传入的 version，日志会带上
+    :param cookie_file: 可选，接口调用时传入的 cookie 文件路径（优先于 COOKIE_FILE）
+    :return: UploadResult(filename, audit_status, reason, success, dede_user_id, duration_sec)
     """
+    global _upload_log_ctx
+    _upload_log_ctx = {"video_name": "", "gindex": gindex, "guid": guid, "version": version, "DedeUserID": ""}
+    start_time = time.time()
     filename = ""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         msg = "请先安装 playwright: pip install playwright，并执行: playwright install chromium"
-        print(msg)
-        return UploadResult("", "error", msg, False)
+        _ulog(msg)
+        return UploadResult("", "error", msg, False, "", time.time() - start_time)
 
     video_path = os.path.abspath(video_path_arg if video_path_arg else VIDEO_PATH)
     filename = os.path.basename(video_path)
+    _upload_log_ctx["video_name"] = filename
     if not os.path.isfile(video_path):
         msg = "视频文件不存在: {}".format(video_path)
-        print(msg)
-        return UploadResult(filename, "error", msg, False)
+        _ulog(msg)
+        return UploadResult(filename, "error", msg, False, "", time.time() - start_time)
 
-    cookies_list = get_cookies_list()
+    # 接口调用时优先使用传入的 cookie_file；若路径不存在则再试当前脚本同目录的 cookie.json
+    cookies_list = None
+    if cookie_file:
+        _dir = os.path.dirname(os.path.abspath(__file__))
+        paths_to_try = [
+            os.path.abspath(cookie_file) if not os.path.isabs(cookie_file) else cookie_file,
+            os.path.join(_dir, "cookie.json"),
+        ]
+        paths_to_try = list(dict.fromkeys(paths_to_try))  # 去重
+        for cookie_path in paths_to_try:
+            if not os.path.isfile(cookie_path):
+                _ulog("Cookie 文件不存在: {}".format(cookie_path))
+                continue
+            _ulog("正在从 Cookie 文件加载: {}".format(cookie_path))
+            cookies_list = load_cookies_from_file(cookie_path)
+            if cookies_list:
+                break
+            _ulog("Cookie 文件格式无效，需包含 SESSDATA 与 bili_jct，或为数组 [{\"SESSDATA\":\"...\",\"bili_jct\":\"...\"}]。")
+    if not cookies_list:
+        cookies_list = get_cookies_list()
     if not cookies_list:
         msg = "未配置 Cookie。请填写 COOKIES_LIST（数组）或 COOKIE_FILE / COOKIES_DICT。"
-        print(msg)
-        return UploadResult(filename, "error", msg, False)
+        _ulog(msg)
+        _notify_feishu_cookie_invalid(msg)
+        return UploadResult(filename, "error", msg, False, "", time.time() - start_time)
 
     title = (title_arg if title_arg is not None else VIDEO_TITLE or "")
     if hasattr(title, "strip"):
         title = title.strip()
     title = title or os.path.splitext(filename)[0]
     last_error = None
+    used_dede_user_id = ""
+
+    # 随机打乱 cookie 顺序，避免总是用第一个；不能用再依次尝试其他
+    random.shuffle(cookies_list)
 
     global _browser_to_close
     with sync_playwright() as p:
@@ -507,6 +671,8 @@ def main(video_path_arg=None, title_arg=None):
         _browser_to_close = browser  # 进程终止时 atexit 会关
         try:
             for idx, cookies in enumerate(cookies_list):
+                _upload_log_ctx["DedeUserID"] = cookies.get("DedeUserID") or ""
+                used_dede_user_id = _upload_log_ctx["DedeUserID"]
                 context = None
                 try:
                     context = browser.new_context(
@@ -521,7 +687,8 @@ def main(video_path_arg=None, title_arg=None):
                     page.wait_for_timeout(4000)
 
                     if _is_cookie_expired(page):
-                        print("[账号 {}] Cookie 已过期，换下一账号重试。".format(idx + 1))
+                        _ulog("[账号 {}] Cookie 已过期，换下一账号重试。".format(idx + 1))
+                        _notify_feishu_cookie_invalid("Cookie 已过期，请重新获取后更新 cookie 文件", dede_user_id=used_dede_user_id)
                         if context:
                             context.close()
                         continue
@@ -550,9 +717,9 @@ def main(video_path_arg=None, title_arg=None):
                     page.wait_for_timeout(6000)
                     _set_visibility_only_self(page)
                     # 动态监听视频上传完成后再进行下一步，大文件（如 500M）会等较久
-                    print("等待视频上传完成（动态监听，上传中会持续等待）...")
+                    _ulog("等待视频上传完成（动态监听，上传中会持续等待）...")
                     if not _wait_upload_complete(page):
-                        print("等待上传完成超时，跳过本账号（未上传完不填表投稿）。")
+                        _ulog("等待上传完成超时，跳过本账号（未上传完不填表投稿）。")
                         if context:
                             context.close()
                         continue
@@ -560,12 +727,12 @@ def main(video_path_arg=None, title_arg=None):
                     # 上传完成后固定等 N 秒，让 B 站用视频首帧截图生成封面、封面框里有值
                     wait_sec = max(0, WAIT_AFTER_UPLOAD_SEC)
                     if wait_sec > 0:
-                        print("等待首帧截图生成封面（{} 秒）...".format(wait_sec))
+                        _ulog("等待首帧截图生成封面（{} 秒）...".format(wait_sec))
                         page.wait_for_timeout(wait_sec * 1000)
                     # 等封面与必填项就绪（封面常在上传完成后自动生成）
-                    print("等待封面与必填项就绪...")
+                    _ulog("等待封面与必填项就绪...")
                     if not _wait_cover_and_required_ready(page):
-                        print("等待封面就绪超时，继续尝试投稿。")
+                        _ulog("等待封面就绪超时，继续尝试投稿。")
                     page.wait_for_timeout(1500)
 
                     # 4. 填标题
@@ -585,29 +752,42 @@ def main(video_path_arg=None, title_arg=None):
                     except Exception:
                         pass
 
-                    # 4.6 点投稿前再等封面就绪，与封面识别同步，避免「封面图未上传」导致上传失败
-                    print("点投稿前确认封面已就绪...")
+                    # 4.6 点投稿前确保封面框里有封面：先尝试「使用首帧」等，再等「请先上传封面」消失
+                    _ulog("点投稿前确保封面框有封面（必要时使用首帧）...")
+                    _ensure_cover_from_first_frame(page)
+                    _ulog("点投稿前确认封面已就绪（无「请先上传封面」等提示）...")
                     deadline = time.time() + 60
+                    ok_count = 0
+                    required_ok = 2  # 连续 2 次无封面提示才继续，避免刚消失又出现
                     while time.time() < deadline:
                         try:
                             text = page.inner_text("body")
-                            if not _has_cover_not_ready_prompt(text):
-                                break
+                            if _has_cover_not_ready_prompt(text):
+                                ok_count = 0
+                            else:
+                                ok_count += 1
+                                if ok_count >= required_ok:
+                                    break
                         except Exception:
-                            pass
+                            ok_count = 0
                         page.wait_for_timeout(UPLOAD_POLL_INTERVAL_SEC * 1000)
-                    page.wait_for_timeout(1500)
+                    page.wait_for_timeout(2000)  # 封面就绪后再等 2 秒，确保封面框已填
                     # 封面就绪后再等几秒，让「立即投稿」按钮出现（先上传视频 → 等封面框有值 → 再触发投稿）
                     if WAIT_BEFORE_CLICK_SUBMIT_SEC > 0:
-                        print("封面就绪，等待 {} 秒后点击投稿...".format(WAIT_BEFORE_CLICK_SUBMIT_SEC))
+                        _ulog("封面就绪，等待 {} 秒后点击投稿...".format(WAIT_BEFORE_CLICK_SUBMIT_SEC))
                         page.wait_for_timeout(WAIT_BEFORE_CLICK_SUBMIT_SEC * 1000)
 
                     # 4.7 投稿前再设一次可见范围（若上传过程中未勾选成功）
                     _set_visibility_only_self(page)
 
                     # 5. 点击立即投稿（若有封面上传提示则等 2 秒再点一次）
-                    submit_btn = page.get_by_text("立即投稿")
-                    submit_btn.wait_for(state="visible", timeout=SUBMIT_BTN_VISIBLE_TIMEOUT_MS)
+                    _ulog("等待投稿按钮出现（先试「立即投稿」，再试「投稿」）...")
+                    submit_btn = _get_submit_btn(page)
+                    if not submit_btn:
+                        _ulog("未找到投稿按钮（立即投稿/投稿），跳过本账号。")
+                        if context:
+                            context.close()
+                        continue
                     submit_btn.scroll_into_view_if_needed()
                     for attempt in range(2):  # 最多点两次：首次 + 遇封面提示再点一次
                         try:
@@ -618,48 +798,101 @@ def main(video_path_arg=None, title_arg=None):
                         try:
                             text = page.inner_text("body")
                             if _has_cover_not_ready_prompt(text):
-                                print("检测到封面未就绪提示，等待 2 秒后再次点击投稿。")
+                                _ulog("检测到「请先上传封面」等提示，尝试使用首帧后再重试投稿。")
+                                page.keyboard.press("Escape")  # 关闭弹窗
+                                page.wait_for_timeout(500)
+                                _ensure_cover_from_first_frame(page)
                                 page.wait_for_timeout(2000)
-                                submit_btn.scroll_into_view_if_needed()
+                                submit_btn = _get_submit_btn(page)
+                                if submit_btn:
+                                    submit_btn.scroll_into_view_if_needed()
                                 continue
                         except Exception:
                             pass
                         break
 
                     if _is_account_limit(page):
-                        print("[账号 {}] 账号投稿限制（过于频繁或今日上限），换下一账号重试。".format(idx + 1))
+                        _ulog("[账号 {}] 账号投稿限制（过于频繁或今日上限），换下一账号重试。".format(idx + 1))
                         if context:
                             context.close()
                         continue
 
                     if _is_submit_ok(page):
-                        print("提交成功，请到 B 站创作中心查看稿件状态。")
+                        # 投稿后若仍出现封面未就绪/报错（如封面图没识别出来），不视为投稿完成，先等待后重试投稿
+                        for _ in range(2):
+                            try:
+                                text = page.inner_text("body")
+                                if not _has_cover_not_ready_prompt(text):
+                                    break
+                            except Exception:
+                                break
+                            _ulog("检测到封面未就绪或报错（如封面图没识别出来），不视为投稿完成，等待 5 秒后重试投稿。")
+                            page.wait_for_timeout(5000)
+                            submit_btn = _get_submit_btn(page)
+                            if not submit_btn:
+                                _ulog("重试时未找到投稿按钮。")
+                                break
+                            submit_btn.click(timeout=10000)
+                            page.wait_for_timeout(5000)
+                        # 若仍有封面报错，不进行「进行中」校验，换下一账号
+                        try:
+                            text = page.inner_text("body")
+                            if _has_cover_not_ready_prompt(text):
+                                _ulog("封面仍未就绪或报错，不进行投稿中列表校验，换下一账号重试。")
+                                if context:
+                                    context.close()
+                                continue
+                        except Exception:
+                            pass
+                        _ulog("投稿完成，刷新投稿中列表校验是否出现进行中（最多等 2 秒）...")
+                        has_in_progress = _check_is_pubing_has_in_progress(context, timeout_sec=2)
+                        if not has_in_progress:
+                            _ulog("投稿后 2 秒内未在投稿中列表看到进行中，重试投稿（可能未提交保存）。")
+                            try:
+                                submit_btn = _get_submit_btn(page)
+                                if submit_btn:
+                                    submit_btn.click(timeout=10000)
+                                    page.wait_for_timeout(5000)
+                                    has_in_progress = _check_is_pubing_has_in_progress(context, timeout_sec=2)
+                                    if has_in_progress:
+                                        _ulog("重试投稿后，投稿中列表已出现进行中。")
+                                else:
+                                    _ulog("重试时未找到投稿按钮，无法再次点击。")
+                            except Exception as e:
+                                _ulog("重试投稿时出错: {}".format(e))
+                        if not has_in_progress:
+                            _ulog("投稿后仍未在投稿中列表看到进行中，视为未提交成功，换下一账号重试。")
+                            if context:
+                                context.close()
+                            continue
+                        _ulog("提交成功，请到 B 站创作中心查看稿件状态。")
                         audit_status = "submitted"
                         reason = "已提交成功"
                         if POLL_AUDIT:
                             result = wait_for_audit_result(page, title)
                             if result == "passed":
-                                print("审核结果：已通过。")
+                                _ulog("审核结果：已通过。")
                                 audit_status = "passed"
                                 reason = "审核通过"
                             elif result == "rejected":
-                                print("审核结果：未通过/已退回，请到创作中心查看原因。")
+                                _ulog("审核结果：未通过/已退回，请到创作中心查看原因。")
                                 audit_status = "rejected"
                                 reason = "审核未通过/已退回，请到创作中心查看原因"
                             else:
-                                print("审核结果：超时未出结果，请到创作中心稿件管理查看。")
+                                _ulog("审核结果：超时未出结果，请到创作中心稿件管理查看。")
                                 audit_status = "timeout"
                                 reason = "审核监听超时未出结果，请到创作中心稿件管理查看"
                         if context:
                             context.close()
                         _browser_to_close = None
                         browser.close()
-                        return UploadResult(filename, audit_status, reason, success=(audit_status == "passed"))
+                        duration_sec = round(time.time() - start_time, 2)
+                        return UploadResult(filename, audit_status, reason, success=(audit_status == "passed"), dede_user_id=used_dede_user_id, duration_sec=duration_sec)
                     if context:
                         context.close()
                 except Exception as e:
                     last_error = e
-                    print("[账号 {}] 出错: {}".format(idx + 1, e))
+                    _ulog("[账号 {}] 出错: {}".format(idx + 1, e))
                     if context:
                         try:
                             context.close()
@@ -669,13 +902,15 @@ def main(video_path_arg=None, title_arg=None):
 
             browser.close()
             _browser_to_close = None
+            duration_sec = round(time.time() - start_time, 2)
             if last_error:
                 msg = "投稿过程出错: {}".format(last_error)
-                print(msg)
-                return UploadResult(filename, "error", msg, False)
+                _ulog(msg)
+                return UploadResult(filename, "error", msg, False, used_dede_user_id, duration_sec)
             msg = "所有账号均未成功（Cookie 过期或账号限制），请检查配置或稍后重试。"
-            print(msg)
-            return UploadResult(filename, "error", msg, False)
+            _ulog(msg)
+            _notify_feishu_cookie_invalid(msg, dede_user_id=used_dede_user_id or None)
+            return UploadResult(filename, "error", msg, False, used_dede_user_id, duration_sec)
         finally:
             _ensure_browser_closed()
 

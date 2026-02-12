@@ -1,3 +1,5 @@
 # B 站 Playwright 上传脚本依赖
 # Python 3.7+
 playwright>=1.40.0
+# POST 接口 api_push.py 需要
+flask>=2.0.0

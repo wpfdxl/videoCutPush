@@ -61,6 +61,23 @@ python upload_bilibili.py --video /path/to/video.mp4 --title "投稿标题"
 - 默认有头模式；无头在脚本中设 `HEADLESS = True`。
 - 多账号时：Cookie 过期或账号限制会打印提示并换下一账号重试，全部失败则退出。
 
+### POST 接口（合并 + 推送）
+
+提供 HTTP 接口：先按 `merge_mp4_ffmpeg2` 逻辑将多段 mp4 合并为一个，再推送到 B 站。
+
+```bash
+python3 -m playwright_push.api_push --host 0.0.0.0 --port 8188
+```
+
+- **路径**：`POST /push/playwright_bilibili`
+- **请求体**：JSON，必填 `videos`（mp4 路径或 URL 数组），可选 `gindex`、`guid`、`version`、`retry`、`reencode`、`title`
+- **响应**：`code=0` 仅当审核状态为「已通过」或「未通过」；`code=-100` 为合并前/合并报错；`code=-200` 为 Cookie 错误、push 失败等，失败原因在 `data[0].error_reason`
+- **Cookie**：使用同目录 `cookie.json`，多账号时随机取一个，不可用再试其他
+
+完整入参、响应结构、业务码与示例见 **[docs/api_push.md](docs/api_push.md)**。
+
+---
+
 ### 被 merge_mp4_ffmpeg2 调用
 
 在项目根目录执行合并并推送：
