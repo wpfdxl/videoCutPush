@@ -4,7 +4,7 @@ MP4 小工具：**按列表文件合并**（ffmpeg 不重编码 / MoviePy 重编
 
 ## 环境
 
-- Python 2.7+
+- Python 3.7+
 - 系统安装 ffmpeg（所有脚本都依赖）
 
 ```bash
